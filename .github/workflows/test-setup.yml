@@ -24,10 +24,10 @@ jobs:
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-to-assume: arn:aws:iam::765726488060:role/GitHubActionsRole
           aws-region: us-east-1
 
-      - name: Test AWS Access
+      - name: Verify AWS Access
         run: |
           echo "Testing AWS access..."
           aws sts get-caller-identity
