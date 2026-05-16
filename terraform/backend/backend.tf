@@ -28,9 +28,12 @@ terraform {
     # AWS region where the S3 bucket is located
     region = "us-east-1"
     
-    # DynamoDB table for state locking
-    # Prevents concurrent modifications to the same state file
-    dynamodb_table = "terraform-locks"
+    # State locking configuration
+    # For Terraform >= 1.6: Uses S3 native locking with lockfile
+    use_lockfile = true
+    
+    # For Terraform < 1.6: Uncomment the line below and comment use_lockfile
+    # dynamodb_table = "terraform-locks"
     
     # Enable server-side encryption for state files
     encrypt = true

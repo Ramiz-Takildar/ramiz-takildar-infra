@@ -369,10 +369,32 @@ aws s3api put-bucket-lifecycle-configuration \
 echo "✅ S3 bucket created: $BUCKET_NAME"
 ```
 
-### Step 2: Create DynamoDB Table for State Locking
+### Step 2: State Locking Configuration
+
+**Terraform 1.6+ (Recommended)**: Uses S3 native locking with `.terraform.lock.hcl` file - **no DynamoDB needed!**
+
+**Terraform < 1.6**: Requires DynamoDB table for state locking.
+
+#### Check Your Terraform Version
 
 ```bash
-# Create DynamoDB table
+terraform --version
+# If >= 1.6.0, you can skip DynamoDB setup
+# If < 1.6.0, create DynamoDB table below
+```
+
+#### Option A: Terraform 1.6+ (No DynamoDB Needed)
+
+```bash
+# No additional setup required!
+# S3 native locking is configured in backend.hcl with use_lockfile = true
+echo "✅ Using S3 native locking (Terraform 1.6+)"
+```
+
+#### Option B: Terraform < 1.6 (DynamoDB Required)
+
+```bash
+# Create DynamoDB table for older Terraform versions
 aws dynamodb create-table \
   --table-name terraform-locks \
   --attribute-definitions AttributeName=LockID,AttributeType=S \
@@ -382,6 +404,10 @@ aws dynamodb create-table \
 
 # Wait for table to be active
 aws dynamodb wait table-exists --table-name terraform-locks
+
+# Update backend.hcl to use DynamoDB
+# Comment out: use_lockfile = true
+# Uncomment: dynamodb_table = "terraform-locks"
 
 echo "✅ DynamoDB table created: terraform-locks"
 ```
