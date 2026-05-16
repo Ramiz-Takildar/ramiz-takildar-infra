@@ -18,7 +18,7 @@ variable "max_availability_zones" {
   description = "Maximum number of availability zones to use"
   type        = number
   default     = 3
-  
+
   validation {
     condition     = var.max_availability_zones >= 2 && var.max_availability_zones <= 3
     error_message = "max_availability_zones must be between 2 and 3"
@@ -83,7 +83,7 @@ variable "flow_logs_traffic_type" {
   description = "Type of traffic to log (ACCEPT, REJECT, or ALL)"
   type        = string
   default     = "ALL"
-  
+
   validation {
     condition     = contains(["ACCEPT", "REJECT", "ALL"], var.flow_logs_traffic_type)
     error_message = "flow_logs_traffic_type must be one of: ACCEPT, REJECT, ALL"

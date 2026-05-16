@@ -19,7 +19,7 @@ variable "instance_count" {
   description = "Number of EC2 instances to create"
   type        = number
   default     = 1
-  
+
   validation {
     condition     = var.instance_count >= 1 && var.instance_count <= 10
     error_message = "instance_count must be between 1 and 10"
@@ -56,7 +56,7 @@ variable "root_volume_size" {
   description = "Size of the root volume in GB"
   type        = number
   default     = 20
-  
+
   validation {
     condition     = var.root_volume_size >= 8 && var.root_volume_size <= 1000
     error_message = "root_volume_size must be between 8 and 1000 GB"
@@ -67,7 +67,7 @@ variable "root_volume_type" {
   description = "Type of root volume"
   type        = string
   default     = "gp3"
-  
+
   validation {
     condition     = contains(["gp2", "gp3", "io1", "io2"], var.root_volume_type)
     error_message = "root_volume_type must be one of: gp2, gp3, io1, io2"
