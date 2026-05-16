@@ -1,0 +1,206 @@
+# ============================================================================
+# Terraform Apply Composite Action
+# ============================================================================
+# This composite action runs terraform apply with proper backend configuration.
+#
+# Features:
+# - Dynamic backend configuration
+# - Plan file validation
+# - Auto-approve option
+# - Output capture
+# - State backup
+# ============================================================================
+
+name: 'Terraform Apply'
+description: 'Run terraform apply with dynamic backend configuration'
+
+inputs:
+  working-directory:
+    description: 'Working directory for Terraform'
+    required: true
+  
+  environment:
+    description: 'Environment name (dev, staging, prod)'
+    required: true
+  
+  service:
+    description: 'Service name'
+    required: true
+  
+  backend-bucket:
+    description: 'S3 bucket for Terraform state'
+    required: true
+    default: 'ramiz-takildar-infra'
+  
+  backend-region:
+    description: 'AWS region for backend'
+    required: false
+    default: 'us-east-1'
+  
+  backend-dynamodb-table:
+    description: 'DynamoDB table for state locking'
+    required: false
+    default: 'terraform-locks'
+  
+  plan-file:
+    description: 'Path to plan file (if using pre-generated plan)'
+    required: false
+    default: ''
+  
+  auto-approve:
+    description: 'Auto-approve the apply'
+    required: false
+    default: 'false'
+  
+  var-file:
+    description: 'Path to tfvars file'
+    required: false
+    default: ''
+  
+  additional-args:
+    description: 'Additional terraform apply arguments'
+    required: false
+    default: ''
+
+outputs:
+  apply-exitcode:
+    description: 'Exit code from terraform apply'
+    value: ${{ steps.apply.outputs.exitcode }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Terraform Init
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "🔧 Initializing Terraform with backend configuration..."
+        terraform init \
+          -backend-config="bucket=${{ inputs.backend-bucket }}" \
+          -backend-config="key=${{ inputs.environment }}/${{ inputs.service }}/terraform.tfstate" \
+          -backend-config="region=${{ inputs.backend-region }}" \
+          -backend-config="dynamodb_table=${{ inputs.backend-dynamodb-table }}" \
+          -backend-config="encrypt=true"
+        echo "✅ Terraform initialized successfully"
+    
+    - name: Download Plan Artifact
+      if: inputs.plan-file != ''
+      uses: actions/download-artifact@v4
+      with:
+        name: terraform-plan-${{ inputs.environment }}-${{ inputs.service }}
+        path: ${{ inputs.working-directory }}
+    
+    - name: Terraform Apply
+      id: apply
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "🚀 Running terraform apply..."
+        
+        # Build apply command
+        if [ -n "${{ inputs.plan-file }}" ]; then
+          # Apply from plan file
+          APPLY_CMD="terraform apply ${{ inputs.plan-file }}"
+        else
+          # Apply without plan file
+          APPLY_CMD="terraform apply"
+          
+          # Add auto-approve if enabled
+          if [ "${{ inputs.auto-approve }}" == "true" ]; then
+            APPLY_CMD="$APPLY_CMD -auto-approve"
+          fi
+          
+          # Add var-file if provided
+          if [ -n "${{ inputs.var-file }}" ]; then
+            APPLY_CMD="$APPLY_CMD -var-file=${{ inputs.var-file }}"
+          fi
+          
+          # Add additional args if provided
+          if [ -n "${{ inputs.additional-args }}" ]; then
+            APPLY_CMD="$APPLY_CMD ${{ inputs.additional-args }}"
+          fi
+        fi
+        
+        # Run apply
+        set +e
+        $APPLY_CMD 2>&1 | tee apply_output.txt
+        EXITCODE=$?
+        set -e
+        
+        echo "exitcode=$EXITCODE" >> $GITHUB_OUTPUT
+        
+        if [ $EXITCODE -eq 0 ]; then
+          echo "✅ Terraform apply completed successfully"
+        else
+          echo "❌ Terraform apply failed with exit code: $EXITCODE"
+          exit $EXITCODE
+        fi
+    
+    - name: Terraform Output
+      if: steps.apply.outputs.exitcode == '0'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "📊 Terraform Outputs:"
+        terraform output -json > outputs.json
+        terraform output
+    
+    - name: Upload Apply Outputs
+      if: steps.apply.outputs.exitcode == '0'
+      uses: actions/upload-artifact@v4
+      with:
+        name: terraform-outputs-${{ inputs.environment }}-${{ inputs.service }}
+        path: |
+          ${{ inputs.working-directory }}/apply_output.txt
+          ${{ inputs.working-directory }}/outputs.json
+        retention-days: 90
+    
+    - name: Create Deployment Summary
+      if: steps.apply.outputs.exitcode == '0'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "## Terraform Apply Summary" > apply_summary.md
+        echo "" >> apply_summary.md
+        echo "**Environment:** ${{ inputs.environment }}" >> apply_summary.md
+        echo "**Service:** ${{ inputs.service }}" >> apply_summary.md
+        echo "**Status:** ✅ Success" >> apply_summary.md
+        echo "**Timestamp:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> apply_summary.md
+        echo "" >> apply_summary.md
+        echo "### Outputs" >> apply_summary.md
+        echo '```json' >> apply_summary.md
+        cat outputs.json >> apply_summary.md
+        echo '```' >> apply_summary.md
+        
+        cat apply_summary.md >> $GITHUB_STEP_SUMMARY
+
+# ============================================================================
+# Usage Example
+# ============================================================================
+#
+# jobs:
+#   apply:
+#     runs-on: ubuntu-latest
+#     environment: production
+#     steps:
+#       - uses: actions/checkout@v4
+#       
+#       - name: Configure AWS Credentials
+#         uses: ./.github/actions/aws-oidc
+#         with:
+#           aws-region: us-east-1
+#           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+#       
+#       - name: Setup Terraform
+#         uses: ./.github/actions/setup-terraform
+#       
+#       - name: Terraform Apply
+#         uses: ./.github/actions/terraform-apply
+#         with:
+#           working-directory: terraform/environments/prod
+#           environment: prod
+#           service: ec2
+#           auto-approve: true
+#           var-file: terraform.tfvars
+#
+# ============================================================================

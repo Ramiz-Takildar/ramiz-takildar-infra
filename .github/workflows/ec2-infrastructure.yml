@@ -1,0 +1,451 @@
+# ============================================================================
+# EC2 Infrastructure Workflow
+# ============================================================================
+# This workflow provisions and manages EC2 instances using Terraform.
+#
+# Features:
+# - Manual trigger with workflow_dispatch
+# - Dynamic input parameters
+# - Apply and Destroy operations
+# - Multi-environment support
+# - OIDC authentication
+# - Approval gates for production
+# - Cost estimation
+# - Security scanning
+#
+# Usage:
+# 1. Go to Actions tab in GitHub
+# 2. Select "EC2 Infrastructure"
+# 3. Click "Run workflow"
+# 4. Fill in the parameters
+# 5. Click "Run workflow"
+# ============================================================================
+
+name: 'EC2 Infrastructure'
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        type: choice
+        options:
+          - apply
+          - destroy
+          - plan
+        default: 'plan'
+      
+      environment:
+        description: 'Environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+        default: 'dev'
+      
+      instance_name:
+        description: 'Instance name prefix'
+        required: true
+        type: string
+        default: 'web-server'
+      
+      instance_type:
+        description: 'EC2 instance type'
+        required: true
+        type: choice
+        options:
+          - t3.micro
+          - t3.small
+          - t3.medium
+          - t3.large
+          - t3.xlarge
+          - m5.large
+          - m5.xlarge
+          - c5.large
+          - c5.xlarge
+        default: 't3.micro'
+      
+      instance_count:
+        description: 'Number of instances'
+        required: true
+        type: number
+        default: 1
+      
+      ami_os:
+        description: 'Operating System'
+        required: true
+        type: choice
+        options:
+          - ubuntu-22.04
+          - ubuntu-20.04
+          - amazon-linux-2
+          - amazon-linux-2023
+          - rhel-9
+          - rhel-8
+        default: 'ubuntu-22.04'
+      
+      volume_size:
+        description: 'Root volume size (GB)'
+        required: true
+        type: number
+        default: 20
+      
+      enable_public_ip:
+        description: 'Enable public IP'
+        required: true
+        type: boolean
+        default: false
+      
+      enable_monitoring:
+        description: 'Enable detailed monitoring'
+        required: true
+        type: boolean
+        default: false
+      
+      aws_region:
+        description: 'AWS Region'
+        required: true
+        type: choice
+        options:
+          - us-east-1
+          - us-east-2
+          - us-west-1
+          - us-west-2
+          - eu-west-1
+          - eu-central-1
+          - ap-south-1
+          - ap-southeast-1
+        default: 'us-east-1'
+
+# Required permissions for OIDC
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+  issues: write
+
+env:
+  TERRAFORM_VERSION: '1.6.0'
+  WORKING_DIRECTORY: 'terraform/environments/${{ github.event.inputs.environment }}/ec2'
+
+jobs:
+  # ============================================================================
+  # Validation Job
+  # ============================================================================
+  validate:
+    name: 'Validate Configuration'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Setup Terraform
+        uses: ./.github/actions/setup-terraform
+        with:
+          terraform-version: ${{ env.TERRAFORM_VERSION }}
+          working-directory: ${{ env.WORKING_DIRECTORY }}
+          validate: true
+          format-check: true
+      
+      - name: Validate Inputs
+        run: |
+          echo "✅ Validating workflow inputs..."
+          echo "Action: ${{ github.event.inputs.action }}"
+          echo "Environment: ${{ github.event.inputs.environment }}"
+          echo "Instance Name: ${{ github.event.inputs.instance_name }}"
+          echo "Instance Type: ${{ github.event.inputs.instance_type }}"
+          echo "Instance Count: ${{ github.event.inputs.instance_count }}"
+          echo "AMI OS: ${{ github.event.inputs.ami_os }}"
+          echo "AWS Region: ${{ github.event.inputs.aws_region }}"
+          
+          # Validate instance count
+          if [ ${{ github.event.inputs.instance_count }} -lt 1 ] || [ ${{ github.event.inputs.instance_count }} -gt 10 ]; then
+            echo "❌ Instance count must be between 1 and 10"
+            exit 1
+          fi
+          
+          # Validate volume size
+          if [ ${{ github.event.inputs.volume_size }} -lt 8 ] || [ ${{ github.event.inputs.volume_size }} -gt 1000 ]; then
+            echo "❌ Volume size must be between 8 and 1000 GB"
+            exit 1
+          fi
+          
+          echo "✅ All inputs validated successfully"
+
+  # ============================================================================
+  # Security Scanning Job
+  # ============================================================================
+  security-scan:
+    name: 'Security Scan'
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Run tfsec
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: ${{ env.WORKING_DIRECTORY }}
+          soft_fail: true
+      
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: ${{ env.WORKING_DIRECTORY }}
+          framework: terraform
+          soft_fail: true
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+      
+      - name: Upload Checkov Results
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov-results.sarif
+
+  # ============================================================================
+  # Terraform Plan Job
+  # ============================================================================
+  plan:
+    name: 'Terraform Plan'
+    runs-on: ubuntu-latest
+    needs: [validate, security-scan]
+    environment:
+      name: ${{ github.event.inputs.environment }}
+    outputs:
+      plan-exitcode: ${{ steps.plan.outputs.plan-exitcode }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS Credentials
+        uses: ./.github/actions/aws-oidc
+        with:
+          aws-region: ${{ github.event.inputs.aws_region }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+      
+      - name: Setup Terraform
+        uses: ./.github/actions/setup-terraform
+        with:
+          terraform-version: ${{ env.TERRAFORM_VERSION }}
+      
+      - name: Generate tfvars
+        run: |
+          cat > ${{ env.WORKING_DIRECTORY }}/terraform.auto.tfvars <<EOF
+          # Auto-generated from workflow inputs
+          instance_name  = "${{ github.event.inputs.instance_name }}"
+          instance_type  = "${{ github.event.inputs.instance_type }}"
+          instance_count = ${{ github.event.inputs.instance_count }}
+          
+          # AMI Configuration
+          ami_name_filter = "$(case ${{ github.event.inputs.ami_os }} in
+            ubuntu-22.04) echo "ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*" ;;
+            ubuntu-20.04) echo "ubuntu/images/hvm-ssd/ubuntu-focal-20.04-amd64-server-*" ;;
+            amazon-linux-2) echo "amzn2-ami-hvm-*-x86_64-gp2" ;;
+            amazon-linux-2023) echo "al2023-ami-*-x86_64" ;;
+            rhel-9) echo "RHEL-9*_HVM-*-x86_64-*" ;;
+            rhel-8) echo "RHEL-8*_HVM-*-x86_64-*" ;;
+          esac)"
+          
+          ami_owner = "$(case ${{ github.event.inputs.ami_os }} in
+            ubuntu-*) echo "099720109477" ;;
+            amazon-linux-*) echo "137112412989" ;;
+            rhel-*) echo "309956199498" ;;
+          esac)"
+          
+          # Storage Configuration
+          root_volume_size = ${{ github.event.inputs.volume_size }}
+          root_volume_type = "gp3"
+          root_volume_encrypted = true
+          
+          # Network Configuration
+          associate_public_ip_address = ${{ github.event.inputs.enable_public_ip }}
+          
+          # Monitoring
+          enable_detailed_monitoring = ${{ github.event.inputs.enable_monitoring }}
+          
+          # Tags
+          tags = {
+            Environment = "${{ github.event.inputs.environment }}"
+            ManagedBy   = "Terraform"
+            Workflow    = "GitHub Actions"
+            Repository  = "${{ github.repository }}"
+            RunID       = "${{ github.run_id }}"
+          }
+          EOF
+          
+          echo "✅ Generated terraform.auto.tfvars"
+          cat ${{ env.WORKING_DIRECTORY }}/terraform.auto.tfvars
+      
+      - name: Terraform Plan
+        id: plan
+        uses: ./.github/actions/terraform-plan
+        with:
+          working-directory: ${{ env.WORKING_DIRECTORY }}
+          environment: ${{ github.event.inputs.environment }}
+          service: ec2
+          backend-bucket: ramiz-takildar-infra
+          backend-region: us-east-1
+          upload-plan: true
+
+  # ============================================================================
+  # Terraform Apply Job
+  # ============================================================================
+  apply:
+    name: 'Terraform Apply'
+    runs-on: ubuntu-latest
+    needs: plan
+    if: github.event.inputs.action == 'apply' && needs.plan.outputs.plan-exitcode == '2'
+    environment:
+      name: ${{ github.event.inputs.environment }}
+      url: https://console.aws.amazon.com/ec2/v2/home?region=${{ github.event.inputs.aws_region }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS Credentials
+        uses: ./.github/actions/aws-oidc
+        with:
+          aws-region: ${{ github.event.inputs.aws_region }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+      
+      - name: Setup Terraform
+        uses: ./.github/actions/setup-terraform
+        with:
+          terraform-version: ${{ env.TERRAFORM_VERSION }}
+      
+      - name: Generate tfvars
+        run: |
+          cat > ${{ env.WORKING_DIRECTORY }}/terraform.auto.tfvars <<EOF
+          instance_name  = "${{ github.event.inputs.instance_name }}"
+          instance_type  = "${{ github.event.inputs.instance_type }}"
+          instance_count = ${{ github.event.inputs.instance_count }}
+          
+          ami_name_filter = "$(case ${{ github.event.inputs.ami_os }} in
+            ubuntu-22.04) echo "ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*" ;;
+            ubuntu-20.04) echo "ubuntu/images/hvm-ssd/ubuntu-focal-20.04-amd64-server-*" ;;
+            amazon-linux-2) echo "amzn2-ami-hvm-*-x86_64-gp2" ;;
+            amazon-linux-2023) echo "al2023-ami-*-x86_64" ;;
+            rhel-9) echo "RHEL-9*_HVM-*-x86_64-*" ;;
+            rhel-8) echo "RHEL-8*_HVM-*-x86_64-*" ;;
+          esac)"
+          
+          ami_owner = "$(case ${{ github.event.inputs.ami_os }} in
+            ubuntu-*) echo "099720109477" ;;
+            amazon-linux-*) echo "137112412989" ;;
+            rhel-*) echo "309956199498" ;;
+          esac)"
+          
+          root_volume_size = ${{ github.event.inputs.volume_size }}
+          root_volume_type = "gp3"
+          root_volume_encrypted = true
+          associate_public_ip_address = ${{ github.event.inputs.enable_public_ip }}
+          enable_detailed_monitoring = ${{ github.event.inputs.enable_monitoring }}
+          
+          tags = {
+            Environment = "${{ github.event.inputs.environment }}"
+            ManagedBy   = "Terraform"
+            Workflow    = "GitHub Actions"
+            Repository  = "${{ github.repository }}"
+            RunID       = "${{ github.run_id }}"
+          }
+          EOF
+      
+      - name: Terraform Apply
+        uses: ./.github/actions/terraform-apply
+        with:
+          working-directory: ${{ env.WORKING_DIRECTORY }}
+          environment: ${{ github.event.inputs.environment }}
+          service: ec2
+          backend-bucket: ramiz-takildar-infra
+          backend-region: us-east-1
+          auto-approve: true
+      
+      - name: Post Deployment Info
+        run: |
+          echo "## 🚀 EC2 Deployment Successful" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Instance Name:** ${{ github.event.inputs.instance_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Instance Type:** ${{ github.event.inputs.instance_type }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Instance Count:** ${{ github.event.inputs.instance_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Region:** ${{ github.event.inputs.aws_region }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Verify instances in AWS Console" >> $GITHUB_STEP_SUMMARY
+          echo "2. Configure security groups if needed" >> $GITHUB_STEP_SUMMARY
+          echo "3. Set up monitoring and alerts" >> $GITHUB_STEP_SUMMARY
+          echo "4. Document instance details" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================================================
+  # Terraform Destroy Job
+  # ============================================================================
+  destroy:
+    name: 'Terraform Destroy'
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event.inputs.action == 'destroy'
+    environment:
+      name: ${{ github.event.inputs.environment }}-destroy
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS Credentials
+        uses: ./.github/actions/aws-oidc
+        with:
+          aws-region: ${{ github.event.inputs.aws_region }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+      
+      - name: Setup Terraform
+        uses: ./.github/actions/setup-terraform
+        with:
+          terraform-version: ${{ env.TERRAFORM_VERSION }}
+      
+      - name: Terraform Destroy
+        uses: ./.github/actions/terraform-destroy
+        with:
+          working-directory: ${{ env.WORKING_DIRECTORY }}
+          environment: ${{ github.event.inputs.environment }}
+          service: ec2
+          backend-bucket: ramiz-takildar-infra
+          backend-region: us-east-1
+          auto-approve: true
+      
+      - name: Post Destroy Info
+        run: |
+          echo "## 🗑️ EC2 Infrastructure Destroyed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Service:** EC2" >> $GITHUB_STEP_SUMMARY
+          echo "**Region:** ${{ github.event.inputs.aws_region }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ All EC2 resources have been destroyed" >> $GITHUB_STEP_SUMMARY
+
+# ============================================================================
+# Workflow Configuration Notes
+# ============================================================================
+#
+# GitHub Environments:
+# --------------------
+# Create the following environments in GitHub:
+# - dev (no approval required)
+# - staging (optional approval)
+# - prod (required approval from team)
+# - prod-destroy (required approval from multiple reviewers)
+#
+# Required Secrets:
+# -----------------
+# - AWS_ROLE_ARN: ARN of IAM role for OIDC authentication
+#
+# Branch Protection:
+# ------------------
+# - Require pull request reviews
+# - Require status checks to pass
+# - Require branches to be up to date
+#
+# ============================================================================

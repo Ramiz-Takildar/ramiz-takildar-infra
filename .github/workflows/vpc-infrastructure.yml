@@ -1,0 +1,380 @@
+# ============================================================================
+# VPC Infrastructure Workflow
+# ============================================================================
+# This workflow provisions and manages VPC infrastructure using Terraform.
+#
+# Features:
+# - Manual trigger with workflow_dispatch
+# - Dynamic input parameters
+# - Apply and Destroy operations
+# - Multi-environment support
+# - OIDC authentication
+# - Multi-AZ deployment
+# - NAT Gateway configuration
+# - VPC Endpoints
+# - Security scanning
+#
+# Usage:
+# 1. Go to Actions tab in GitHub
+# 2. Select "VPC Infrastructure"
+# 3. Click "Run workflow"
+# 4. Fill in the parameters
+# 5. Click "Run workflow"
+# ============================================================================
+
+name: 'VPC Infrastructure'
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        type: choice
+        options:
+          - apply
+          - destroy
+          - plan
+        default: 'plan'
+      
+      environment:
+        description: 'Environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+        default: 'dev'
+      
+      vpc_name:
+        description: 'VPC name'
+        required: true
+        type: string
+        default: 'main-vpc'
+      
+      vpc_cidr:
+        description: 'VPC CIDR block'
+        required: true
+        type: string
+        default: '10.0.0.0/16'
+      
+      availability_zones:
+        description: 'Number of availability zones'
+        required: true
+        type: choice
+        options:
+          - '2'
+          - '3'
+        default: '3'
+      
+      create_nat_gateway:
+        description: 'Create NAT Gateways'
+        required: true
+        type: boolean
+        default: true
+      
+      single_nat_gateway:
+        description: 'Use single NAT Gateway (cost optimization)'
+        required: true
+        type: boolean
+        default: false
+      
+      create_database_subnets:
+        description: 'Create database subnets'
+        required: true
+        type: boolean
+        default: false
+      
+      enable_flow_logs:
+        description: 'Enable VPC Flow Logs'
+        required: true
+        type: boolean
+        default: false
+      
+      enable_s3_endpoint:
+        description: 'Enable S3 VPC Endpoint'
+        required: true
+        type: boolean
+        default: false
+      
+      enable_dynamodb_endpoint:
+        description: 'Enable DynamoDB VPC Endpoint'
+        required: true
+        type: boolean
+        default: false
+      
+      aws_region:
+        description: 'AWS Region'
+        required: true
+        type: choice
+        options:
+          - us-east-1
+          - us-east-2
+          - us-west-1
+          - us-west-2
+          - eu-west-1
+          - eu-central-1
+          - ap-south-1
+          - ap-southeast-1
+        default: 'us-east-1'
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+  issues: write
+
+env:
+  TERRAFORM_VERSION: '1.6.0'
+  WORKING_DIRECTORY: 'terraform/environments/${{ github.event.inputs.environment }}/vpc'
+
+jobs:
+  validate:
+    name: 'Validate Configuration'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Setup Terraform
+        uses: ./.github/actions/setup-terraform
+        with:
+          terraform-version: ${{ env.TERRAFORM_VERSION }}
+          working-directory: ${{ env.WORKING_DIRECTORY }}
+          validate: true
+          format-check: true
+      
+      - name: Validate Inputs
+        run: |
+          echo "✅ Validating workflow inputs..."
+          echo "Action: ${{ github.event.inputs.action }}"
+          echo "Environment: ${{ github.event.inputs.environment }}"
+          echo "VPC Name: ${{ github.event.inputs.vpc_name }}"
+          echo "VPC CIDR: ${{ github.event.inputs.vpc_cidr }}"
+          echo "Availability Zones: ${{ github.event.inputs.availability_zones }}"
+          echo "AWS Region: ${{ github.event.inputs.aws_region }}"
+          
+          # Validate CIDR format
+          if ! echo "${{ github.event.inputs.vpc_cidr }}" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$'; then
+            echo "❌ Invalid CIDR format"
+            exit 1
+          fi
+          
+          echo "✅ All inputs validated successfully"
+
+  security-scan:
+    name: 'Security Scan'
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Run tfsec
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: ${{ env.WORKING_DIRECTORY }}
+          soft_fail: true
+      
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: ${{ env.WORKING_DIRECTORY }}
+          framework: terraform
+          soft_fail: true
+
+  plan:
+    name: 'Terraform Plan'
+    runs-on: ubuntu-latest
+    needs: [validate, security-scan]
+    environment:
+      name: ${{ github.event.inputs.environment }}
+    outputs:
+      plan-exitcode: ${{ steps.plan.outputs.plan-exitcode }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS Credentials
+        uses: ./.github/actions/aws-oidc
+        with:
+          aws-region: ${{ github.event.inputs.aws_region }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+      
+      - name: Setup Terraform
+        uses: ./.github/actions/setup-terraform
+        with:
+          terraform-version: ${{ env.TERRAFORM_VERSION }}
+      
+      - name: Generate tfvars
+        run: |
+          cat > ${{ env.WORKING_DIRECTORY }}/terraform.auto.tfvars <<EOF
+          # Auto-generated from workflow inputs
+          vpc_name = "${{ github.event.inputs.vpc_name }}"
+          vpc_cidr = "${{ github.event.inputs.vpc_cidr }}"
+          
+          # Availability Zones
+          max_availability_zones = ${{ github.event.inputs.availability_zones }}
+          
+          # Subnets
+          create_public_subnets   = true
+          create_private_subnets  = true
+          create_database_subnets = ${{ github.event.inputs.create_database_subnets }}
+          
+          # NAT Gateway
+          create_nat_gateway = ${{ github.event.inputs.create_nat_gateway }}
+          single_nat_gateway = ${{ github.event.inputs.single_nat_gateway }}
+          
+          # Internet Gateway
+          create_internet_gateway = true
+          
+          # VPC Features
+          enable_dns_hostnames = true
+          enable_dns_support   = true
+          
+          # Flow Logs
+          enable_flow_logs = ${{ github.event.inputs.enable_flow_logs }}
+          flow_logs_traffic_type = "ALL"
+          flow_logs_retention_days = 7
+          
+          # VPC Endpoints
+          enable_s3_endpoint       = ${{ github.event.inputs.enable_s3_endpoint }}
+          enable_dynamodb_endpoint = ${{ github.event.inputs.enable_dynamodb_endpoint }}
+          
+          # Tags
+          tags = {
+            Environment = "${{ github.event.inputs.environment }}"
+            ManagedBy   = "Terraform"
+            Workflow    = "GitHub Actions"
+            Repository  = "${{ github.repository }}"
+            RunID       = "${{ github.run_id }}"
+          }
+          EOF
+          
+          echo "✅ Generated terraform.auto.tfvars"
+          cat ${{ env.WORKING_DIRECTORY }}/terraform.auto.tfvars
+      
+      - name: Terraform Plan
+        id: plan
+        uses: ./.github/actions/terraform-plan
+        with:
+          working-directory: ${{ env.WORKING_DIRECTORY }}
+          environment: ${{ github.event.inputs.environment }}
+          service: vpc
+          backend-bucket: ramiz-takildar-infra
+          backend-region: us-east-1
+          upload-plan: true
+
+  apply:
+    name: 'Terraform Apply'
+    runs-on: ubuntu-latest
+    needs: plan
+    if: github.event.inputs.action == 'apply' && needs.plan.outputs.plan-exitcode == '2'
+    environment:
+      name: ${{ github.event.inputs.environment }}
+      url: https://console.aws.amazon.com/vpc/home?region=${{ github.event.inputs.aws_region }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS Credentials
+        uses: ./.github/actions/aws-oidc
+        with:
+          aws-region: ${{ github.event.inputs.aws_region }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+      
+      - name: Setup Terraform
+        uses: ./.github/actions/setup-terraform
+        with:
+          terraform-version: ${{ env.TERRAFORM_VERSION }}
+      
+      - name: Generate tfvars
+        run: |
+          cat > ${{ env.WORKING_DIRECTORY }}/terraform.auto.tfvars <<EOF
+          vpc_name = "${{ github.event.inputs.vpc_name }}"
+          vpc_cidr = "${{ github.event.inputs.vpc_cidr }}"
+          max_availability_zones = ${{ github.event.inputs.availability_zones }}
+          create_public_subnets   = true
+          create_private_subnets  = true
+          create_database_subnets = ${{ github.event.inputs.create_database_subnets }}
+          create_nat_gateway = ${{ github.event.inputs.create_nat_gateway }}
+          single_nat_gateway = ${{ github.event.inputs.single_nat_gateway }}
+          create_internet_gateway = true
+          enable_dns_hostnames = true
+          enable_dns_support   = true
+          enable_flow_logs = ${{ github.event.inputs.enable_flow_logs }}
+          flow_logs_traffic_type = "ALL"
+          enable_s3_endpoint       = ${{ github.event.inputs.enable_s3_endpoint }}
+          enable_dynamodb_endpoint = ${{ github.event.inputs.enable_dynamodb_endpoint }}
+          
+          tags = {
+            Environment = "${{ github.event.inputs.environment }}"
+            ManagedBy   = "Terraform"
+            Workflow    = "GitHub Actions"
+            Repository  = "${{ github.repository }}"
+            RunID       = "${{ github.run_id }}"
+          }
+          EOF
+      
+      - name: Terraform Apply
+        uses: ./.github/actions/terraform-apply
+        with:
+          working-directory: ${{ env.WORKING_DIRECTORY }}
+          environment: ${{ github.event.inputs.environment }}
+          service: vpc
+          backend-bucket: ramiz-takildar-infra
+          backend-region: us-east-1
+          auto-approve: true
+      
+      - name: Post Deployment Info
+        run: |
+          echo "## 🌐 VPC Deployed Successfully" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**VPC Name:** ${{ github.event.inputs.vpc_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**VPC CIDR:** ${{ github.event.inputs.vpc_cidr }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Availability Zones:** ${{ github.event.inputs.availability_zones }}" >> $GITHUB_STEP_SUMMARY
+          echo "**NAT Gateways:** ${{ github.event.inputs.create_nat_gateway && 'Enabled' || 'Disabled' }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Region:** ${{ github.event.inputs.aws_region }}" >> $GITHUB_STEP_SUMMARY
+
+  destroy:
+    name: 'Terraform Destroy'
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event.inputs.action == 'destroy'
+    environment:
+      name: ${{ github.event.inputs.environment }}-destroy
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS Credentials
+        uses: ./.github/actions/aws-oidc
+        with:
+          aws-region: ${{ github.event.inputs.aws_region }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+      
+      - name: Setup Terraform
+        uses: ./.github/actions/setup-terraform
+        with:
+          terraform-version: ${{ env.TERRAFORM_VERSION }}
+      
+      - name: Terraform Destroy
+        uses: ./.github/actions/terraform-destroy
+        with:
+          working-directory: ${{ env.WORKING_DIRECTORY }}
+          environment: ${{ github.event.inputs.environment }}
+          service: vpc
+          backend-bucket: ramiz-takildar-infra
+          backend-region: us-east-1
+          auto-approve: true
+      
+      - name: Post Destroy Info
+        run: |
+          echo "## 🗑️ VPC Infrastructure Destroyed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**VPC Name:** ${{ github.event.inputs.vpc_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ All VPC resources have been destroyed" >> $GITHUB_STEP_SUMMARY

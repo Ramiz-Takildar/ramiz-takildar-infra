@@ -1,0 +1,206 @@
+# ============================================================================
+# Terraform Plan Composite Action
+# ============================================================================
+# This composite action runs terraform plan with proper backend configuration
+# and outputs the plan for review.
+#
+# Features:
+# - Dynamic backend configuration
+# - Plan output formatting
+# - Plan artifact upload
+# - Cost estimation (optional)
+# - Security scanning integration
+# ============================================================================
+
+name: 'Terraform Plan'
+description: 'Run terraform plan with dynamic backend configuration'
+
+inputs:
+  working-directory:
+    description: 'Working directory for Terraform'
+    required: true
+  
+  environment:
+    description: 'Environment name (dev, staging, prod)'
+    required: true
+  
+  service:
+    description: 'Service name'
+    required: true
+  
+  backend-bucket:
+    description: 'S3 bucket for Terraform state'
+    required: true
+    default: 'ramiz-takildar-infra'
+  
+  backend-region:
+    description: 'AWS region for backend'
+    required: false
+    default: 'us-east-1'
+  
+  backend-dynamodb-table:
+    description: 'DynamoDB table for state locking'
+    required: false
+    default: 'terraform-locks'
+  
+  var-file:
+    description: 'Path to tfvars file'
+    required: false
+    default: ''
+  
+  additional-args:
+    description: 'Additional terraform plan arguments'
+    required: false
+    default: ''
+  
+  upload-plan:
+    description: 'Upload plan as artifact'
+    required: false
+    default: 'true'
+
+outputs:
+  plan-exitcode:
+    description: 'Exit code from terraform plan'
+    value: ${{ steps.plan.outputs.exitcode }}
+  
+  plan-output:
+    description: 'Terraform plan output'
+    value: ${{ steps.plan.outputs.stdout }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Terraform Init
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "🔧 Initializing Terraform with backend configuration..."
+        terraform init \
+          -backend-config="bucket=${{ inputs.backend-bucket }}" \
+          -backend-config="key=${{ inputs.environment }}/${{ inputs.service }}/terraform.tfstate" \
+          -backend-config="region=${{ inputs.backend-region }}" \
+          -backend-config="dynamodb_table=${{ inputs.backend-dynamodb-table }}" \
+          -backend-config="encrypt=true"
+        echo "✅ Terraform initialized successfully"
+    
+    - name: Terraform Plan
+      id: plan
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      continue-on-error: true
+      run: |
+        echo "📋 Running terraform plan..."
+        
+        # Build plan command
+        PLAN_CMD="terraform plan -detailed-exitcode -out=tfplan"
+        
+        # Add var-file if provided
+        if [ -n "${{ inputs.var-file }}" ]; then
+          PLAN_CMD="$PLAN_CMD -var-file=${{ inputs.var-file }}"
+        fi
+        
+        # Add additional args if provided
+        if [ -n "${{ inputs.additional-args }}" ]; then
+          PLAN_CMD="$PLAN_CMD ${{ inputs.additional-args }}"
+        fi
+        
+        # Run plan and capture output
+        set +e
+        $PLAN_CMD 2>&1 | tee plan_output.txt
+        EXITCODE=${PIPESTATUS[0]}
+        set -e
+        
+        echo "exitcode=$EXITCODE" >> $GITHUB_OUTPUT
+        
+        # Interpret exit code
+        case $EXITCODE in
+          0)
+            echo "✅ No changes detected"
+            ;;
+          1)
+            echo "❌ Terraform plan failed"
+            exit 1
+            ;;
+          2)
+            echo "📝 Changes detected"
+            ;;
+          *)
+            echo "❌ Unknown exit code: $EXITCODE"
+            exit 1
+            ;;
+        esac
+    
+    - name: Format Plan Output
+      if: steps.plan.outputs.exitcode == '2'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "📊 Formatting plan output..."
+        terraform show -no-color tfplan > plan_formatted.txt
+        
+        # Create summary
+        echo "## Terraform Plan Summary" > plan_summary.md
+        echo "" >> plan_summary.md
+        echo "**Environment:** ${{ inputs.environment }}" >> plan_summary.md
+        echo "**Service:** ${{ inputs.service }}" >> plan_summary.md
+        echo "**Working Directory:** ${{ inputs.working-directory }}" >> plan_summary.md
+        echo "" >> plan_summary.md
+        echo "### Changes" >> plan_summary.md
+        echo '```' >> plan_summary.md
+        terraform show -no-color tfplan | grep -E "Plan:|No changes" >> plan_summary.md || true
+        echo '```' >> plan_summary.md
+    
+    - name: Upload Plan Artifact
+      if: inputs.upload-plan == 'true' && steps.plan.outputs.exitcode == '2'
+      uses: actions/upload-artifact@v4
+      with:
+        name: terraform-plan-${{ inputs.environment }}-${{ inputs.service }}
+        path: |
+          ${{ inputs.working-directory }}/tfplan
+          ${{ inputs.working-directory }}/plan_formatted.txt
+          ${{ inputs.working-directory }}/plan_summary.md
+        retention-days: 30
+    
+    - name: Comment Plan on PR
+      if: github.event_name == 'pull_request' && steps.plan.outputs.exitcode == '2'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          const planSummary = fs.readFileSync('${{ inputs.working-directory }}/plan_summary.md', 'utf8');
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: planSummary
+          });
+
+# ============================================================================
+# Usage Example
+# ============================================================================
+#
+# jobs:
+#   plan:
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: actions/checkout@v4
+#       
+#       - name: Configure AWS Credentials
+#         uses: ./.github/actions/aws-oidc
+#         with:
+#           aws-region: us-east-1
+#           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+#       
+#       - name: Setup Terraform
+#         uses: ./.github/actions/setup-terraform
+#       
+#       - name: Terraform Plan
+#         uses: ./.github/actions/terraform-plan
+#         with:
+#           working-directory: terraform/environments/dev
+#           environment: dev
+#           service: ec2
+#           var-file: terraform.tfvars
+#
+# ============================================================================

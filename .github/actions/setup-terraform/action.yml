@@ -1,0 +1,122 @@
+# ============================================================================
+# Setup Terraform Composite Action
+# ============================================================================
+# This composite action sets up Terraform with caching and validation.
+#
+# Features:
+# - Installs specified Terraform version
+# - Caches Terraform plugins
+# - Validates Terraform configuration
+# - Formats check (optional)
+# - Outputs Terraform version
+# ============================================================================
+
+name: 'Setup Terraform'
+description: 'Setup Terraform with caching and validation'
+
+inputs:
+  terraform-version:
+    description: 'Terraform version to install'
+    required: false
+    default: 'latest'
+  
+  terraform-wrapper:
+    description: 'Enable Terraform wrapper'
+    required: false
+    default: 'true'
+  
+  working-directory:
+    description: 'Working directory for Terraform'
+    required: false
+    default: '.'
+  
+  validate:
+    description: 'Run terraform validate'
+    required: false
+    default: 'true'
+  
+  format-check:
+    description: 'Run terraform fmt -check'
+    required: false
+    default: 'false'
+
+outputs:
+  terraform-version:
+    description: 'Installed Terraform version'
+    value: ${{ steps.setup.outputs.terraform-version }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup Terraform
+      id: setup
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ inputs.terraform-version }}
+        terraform_wrapper: ${{ inputs.terraform-wrapper }}
+    
+    - name: Get Terraform Version
+      shell: bash
+      run: |
+        TERRAFORM_VERSION=$(terraform version -json | jq -r '.terraform_version')
+        echo "terraform-version=$TERRAFORM_VERSION" >> $GITHUB_OUTPUT
+        echo "✅ Terraform version: $TERRAFORM_VERSION"
+    
+    - name: Cache Terraform Plugins
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.terraform.d/plugin-cache
+          ${{ inputs.working-directory }}/.terraform
+        key: ${{ runner.os }}-terraform-${{ hashFiles('**/.terraform.lock.hcl') }}
+        restore-keys: |
+          ${{ runner.os }}-terraform-
+    
+    - name: Terraform Format Check
+      if: inputs.format-check == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "🔍 Checking Terraform formatting..."
+        terraform fmt -check -recursive
+        echo "✅ Terraform formatting is correct"
+    
+    - name: Terraform Init
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "🔧 Initializing Terraform..."
+        terraform init -backend=false
+        echo "✅ Terraform initialized successfully"
+    
+    - name: Terraform Validate
+      if: inputs.validate == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "✅ Validating Terraform configuration..."
+        terraform validate
+        echo "✅ Terraform configuration is valid"
+
+# ============================================================================
+# Usage Example
+# ============================================================================
+#
+# jobs:
+#   terraform:
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: actions/checkout@v4
+#       
+#       - name: Setup Terraform
+#         uses: ./.github/actions/setup-terraform
+#         with:
+#           terraform-version: 1.6.0
+#           working-directory: terraform/environments/dev
+#           validate: true
+#           format-check: true
+#       
+#       - name: Terraform Plan
+#         run: terraform plan
+#
+# ============================================================================

@@ -1,0 +1,441 @@
+name: RDS Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      identifier:
+        description: 'RDS Instance Identifier'
+        required: true
+        type: string
+      engine:
+        description: 'Database Engine'
+        required: true
+        type: choice
+        options:
+          - postgres
+          - mysql
+          - mariadb
+          - oracle-ee
+          - oracle-se2
+          - sqlserver-ee
+          - sqlserver-se
+      engine_version:
+        description: 'Engine Version (e.g., 15.3 for postgres, 8.0.35 for mysql)'
+        required: true
+        type: string
+      instance_class:
+        description: 'Instance Class'
+        required: true
+        type: choice
+        options:
+          - db.t3.micro
+          - db.t3.small
+          - db.t3.medium
+          - db.t3.large
+          - db.m5.large
+          - db.m5.xlarge
+          - db.m5.2xlarge
+          - db.r5.large
+          - db.r5.xlarge
+          - db.r5.2xlarge
+      allocated_storage:
+        description: 'Allocated Storage (GB)'
+        required: false
+        type: string
+        default: '100'
+      multi_az:
+        description: 'Enable Multi-AZ'
+        required: false
+        type: boolean
+        default: true
+      create_read_replica:
+        description: 'Create Read Replicas'
+        required: false
+        type: boolean
+        default: false
+      read_replica_count:
+        description: 'Number of Read Replicas'
+        required: false
+        type: string
+        default: '1'
+
+env:
+  AWS_REGION: us-east-1
+  TF_VERSION: 1.6.0
+  SERVICE_NAME: rds
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action != 'destroy'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run tfsec
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: terraform/modules/rds
+          soft_fail: true
+
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: terraform/modules/rds
+          framework: terraform
+          soft_fail: true
+
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    needs: [security-scan]
+    if: |
+      always() &&
+      (needs.security-scan.result == 'success' || needs.security-scan.result == 'skipped')
+    environment:
+      name: ${{ github.event.inputs.environment }}
+    outputs:
+      plan_exitcode: ${{ steps.plan.outputs.exitcode }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: ./.github/actions/aws-oidc
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+
+      - name: Setup Terraform
+        uses: ./.github/actions/setup-terraform
+        with:
+          terraform-version: ${{ env.TF_VERSION }}
+
+      - name: Create Terraform variables file
+        run: |
+          cat > terraform.tfvars <<EOF
+          identifier      = "${{ github.event.inputs.identifier }}"
+          engine          = "${{ github.event.inputs.engine }}"
+          engine_version  = "${{ github.event.inputs.engine_version }}"
+          instance_class  = "${{ github.event.inputs.instance_class }}"
+          environment     = "${{ github.event.inputs.environment }}"
+          
+          # Storage Configuration
+          allocated_storage     = ${{ github.event.inputs.allocated_storage }}
+          max_allocated_storage = $(( ${{ github.event.inputs.allocated_storage }} * 2 ))
+          storage_type          = "gp3"
+          storage_encrypted     = true
+          
+          # Database Configuration
+          db_name  = "$(echo ${{ github.event.inputs.identifier }} | tr '-' '_')"
+          username = "admin"
+          manage_master_user_password = true
+          
+          # Network Configuration
+          vpc_id     = "${{ secrets.VPC_ID }}"
+          subnet_ids = ${{ secrets.PRIVATE_SUBNET_IDS }}
+          
+          # Security
+          create_security_group      = true
+          allowed_security_group_ids = []
+          allowed_cidr_blocks        = []
+          publicly_accessible        = false
+          
+          # High Availability
+          multi_az = ${{ github.event.inputs.multi_az }}
+          
+          # Backup Configuration
+          backup_retention_period = ${{ github.event.inputs.environment == 'prod' && '30' || '7' }}
+          backup_window          = "03:00-04:00"
+          skip_final_snapshot    = ${{ github.event.inputs.environment == 'prod' && 'false' || 'true' }}
+          
+          # Maintenance
+          maintenance_window         = "sun:04:00-sun:05:00"
+          auto_minor_version_upgrade = true
+          apply_immediately          = false
+          
+          # Parameter Group
+          create_db_parameter_group = true
+          parameter_group_family    = "${{ github.event.inputs.engine == 'postgres' && 'postgres15' || github.event.inputs.engine == 'mysql' && 'mysql8.0' || github.event.inputs.engine == 'mariadb' && 'mariadb10.6' || '' }}"
+          parameters = []
+          
+          # Monitoring
+          enabled_cloudwatch_logs_exports = ${{ github.event.inputs.engine == 'postgres' && '["postgresql", "upgrade"]' || github.event.inputs.engine == 'mysql' && '["error", "general", "slowquery"]' || '[]' }}
+          monitoring_interval             = 60
+          performance_insights_enabled    = true
+          performance_insights_retention_period = ${{ github.event.inputs.environment == 'prod' && '731' || '7' }}
+          
+          # CloudWatch Alarms
+          create_cloudwatch_alarms = true
+          alarm_actions           = []
+          
+          # Read Replicas
+          create_read_replica = ${{ github.event.inputs.create_read_replica }}
+          read_replica_count  = ${{ github.event.inputs.read_replica_count }}
+          
+          # IAM Authentication
+          iam_database_authentication_enabled = false
+          
+          # Secrets Manager
+          create_db_credentials_secret = true
+          
+          # Deletion Protection
+          deletion_protection = ${{ github.event.inputs.environment == 'prod' && 'true' || 'false' }}
+          
+          # Tags
+          tags = {
+            Environment = "${{ github.event.inputs.environment }}"
+            ManagedBy   = "terraform"
+            Service     = "rds"
+            Engine      = "${{ github.event.inputs.engine }}"
+            CreatedBy   = "${{ github.actor }}"
+          }
+          EOF
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}/${{ env.SERVICE_NAME }}
+
+      - name: Terraform Plan
+        id: plan
+        uses: ./.github/actions/terraform-plan
+        with:
+          working-directory: terraform/environments/${{ github.event.inputs.environment }}/${{ env.SERVICE_NAME }}
+          backend-config: |
+            bucket=ramiz-takildar-infra
+            key=${{ github.event.inputs.environment }}/${{ env.SERVICE_NAME }}/terraform.tfstate
+            region=${{ env.AWS_REGION }}
+            dynamodb_table=terraform-locks
+            encrypt=true
+
+      - name: Comment PR with Plan
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const output = `#### Terraform Plan 📖
+            **Environment:** \`${{ github.event.inputs.environment }}\`
+            **Service:** \`${{ env.SERVICE_NAME }}\`
+            **Database:** \`${{ github.event.inputs.identifier }}\`
+            **Engine:** \`${{ github.event.inputs.engine }} ${{ github.event.inputs.engine_version }}\`
+            
+            <details><summary>Show Plan</summary>
+            
+            \`\`\`terraform
+            ${{ steps.plan.outputs.stdout }}
+            \`\`\`
+            
+            </details>
+            
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+  terraform-apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    needs: [terraform-plan]
+    if: |
+      github.event.inputs.action == 'apply' &&
+      needs.terraform-plan.outputs.plan_exitcode == '2'
+    environment:
+      name: ${{ github.event.inputs.environment }}-apply
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: ./.github/actions/aws-oidc
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+
+      - name: Setup Terraform
+        uses: ./.github/actions/setup-terraform
+        with:
+          terraform-version: ${{ env.TF_VERSION }}
+
+      - name: Create Terraform variables file
+        run: |
+          cat > terraform.tfvars <<EOF
+          identifier      = "${{ github.event.inputs.identifier }}"
+          engine          = "${{ github.event.inputs.engine }}"
+          engine_version  = "${{ github.event.inputs.engine_version }}"
+          instance_class  = "${{ github.event.inputs.instance_class }}"
+          environment     = "${{ github.event.inputs.environment }}"
+          
+          allocated_storage     = ${{ github.event.inputs.allocated_storage }}
+          max_allocated_storage = $(( ${{ github.event.inputs.allocated_storage }} * 2 ))
+          storage_type          = "gp3"
+          storage_encrypted     = true
+          
+          db_name  = "$(echo ${{ github.event.inputs.identifier }} | tr '-' '_')"
+          username = "admin"
+          manage_master_user_password = true
+          
+          vpc_id     = "${{ secrets.VPC_ID }}"
+          subnet_ids = ${{ secrets.PRIVATE_SUBNET_IDS }}
+          
+          create_security_group      = true
+          allowed_security_group_ids = []
+          allowed_cidr_blocks        = []
+          publicly_accessible        = false
+          
+          multi_az = ${{ github.event.inputs.multi_az }}
+          
+          backup_retention_period = ${{ github.event.inputs.environment == 'prod' && '30' || '7' }}
+          backup_window          = "03:00-04:00"
+          skip_final_snapshot    = ${{ github.event.inputs.environment == 'prod' && 'false' || 'true' }}
+          
+          maintenance_window         = "sun:04:00-sun:05:00"
+          auto_minor_version_upgrade = true
+          apply_immediately          = false
+          
+          create_db_parameter_group = true
+          parameter_group_family    = "${{ github.event.inputs.engine == 'postgres' && 'postgres15' || github.event.inputs.engine == 'mysql' && 'mysql8.0' || github.event.inputs.engine == 'mariadb' && 'mariadb10.6' || '' }}"
+          parameters = []
+          
+          enabled_cloudwatch_logs_exports = ${{ github.event.inputs.engine == 'postgres' && '["postgresql", "upgrade"]' || github.event.inputs.engine == 'mysql' && '["error", "general", "slowquery"]' || '[]' }}
+          monitoring_interval             = 60
+          performance_insights_enabled    = true
+          performance_insights_retention_period = ${{ github.event.inputs.environment == 'prod' && '731' || '7' }}
+          
+          create_cloudwatch_alarms = true
+          alarm_actions           = []
+          
+          create_read_replica = ${{ github.event.inputs.create_read_replica }}
+          read_replica_count  = ${{ github.event.inputs.read_replica_count }}
+          
+          iam_database_authentication_enabled = false
+          create_db_credentials_secret = true
+          deletion_protection = ${{ github.event.inputs.environment == 'prod' && 'true' || 'false' }}
+          
+          tags = {
+            Environment = "${{ github.event.inputs.environment }}"
+            ManagedBy   = "terraform"
+            Service     = "rds"
+            Engine      = "${{ github.event.inputs.engine }}"
+            CreatedBy   = "${{ github.actor }}"
+          }
+          EOF
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}/${{ env.SERVICE_NAME }}
+
+      - name: Terraform Apply
+        uses: ./.github/actions/terraform-apply
+        with:
+          working-directory: terraform/environments/${{ github.event.inputs.environment }}/${{ env.SERVICE_NAME }}
+          backend-config: |
+            bucket=ramiz-takildar-infra
+            key=${{ github.event.inputs.environment }}/${{ env.SERVICE_NAME }}/terraform.tfstate
+            region=${{ env.AWS_REGION }}
+            dynamodb_table=terraform-locks
+            encrypt=true
+
+      - name: Get RDS instance info
+        id: rds-info
+        run: |
+          DB_ENDPOINT=$(terraform output -raw db_instance_endpoint 2>/dev/null || echo "N/A")
+          DB_ENGINE=$(terraform output -raw db_instance_engine 2>/dev/null || echo "N/A")
+          SECRET_ARN=$(terraform output -raw db_credentials_secret_arn 2>/dev/null || echo "N/A")
+          echo "endpoint=$DB_ENDPOINT" >> $GITHUB_OUTPUT
+          echo "engine=$DB_ENGINE" >> $GITHUB_OUTPUT
+          echo "secret_arn=$SECRET_ARN" >> $GITHUB_OUTPUT
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}/${{ env.SERVICE_NAME }}
+
+      - name: Post deployment summary
+        run: |
+          echo "## RDS Database Deployed Successfully! 🚀" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Database Details" >> $GITHUB_STEP_SUMMARY
+          echo "- **Identifier:** ${{ github.event.inputs.identifier }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment:** ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Engine:** ${{ steps.rds-info.outputs.engine }} ${{ github.event.inputs.engine_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Instance Class:** ${{ github.event.inputs.instance_class }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Endpoint:** ${{ steps.rds-info.outputs.endpoint }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Storage:** ${{ github.event.inputs.allocated_storage }} GB" >> $GITHUB_STEP_SUMMARY
+          echo "- **Multi-AZ:** ${{ github.event.inputs.multi_az }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Read Replicas:** ${{ github.event.inputs.create_read_replica == 'true' && github.event.inputs.read_replica_count || '0' }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Credentials" >> $GITHUB_STEP_SUMMARY
+          echo "Database credentials are stored in AWS Secrets Manager:" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "aws secretsmanager get-secret-value --secret-id ${{ steps.rds-info.outputs.secret_arn }} --query SecretString --output text | jq -r" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Connection Examples" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.event.inputs.engine }}" = "postgres" ]; then
+            echo "**PostgreSQL:**" >> $GITHUB_STEP_SUMMARY
+            echo '```bash' >> $GITHUB_STEP_SUMMARY
+            echo "psql -h ${{ steps.rds-info.outputs.endpoint }} -U admin -d $(echo ${{ github.event.inputs.identifier }} | tr '-' '_')" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ github.event.inputs.engine }}" = "mysql" ] || [ "${{ github.event.inputs.engine }}" = "mariadb" ]; then
+            echo "**MySQL/MariaDB:**" >> $GITHUB_STEP_SUMMARY
+            echo '```bash' >> $GITHUB_STEP_SUMMARY
+            echo "mysql -h ${{ steps.rds-info.outputs.endpoint }} -u admin -p $(echo ${{ github.event.inputs.identifier }} | tr '-' '_')" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+  terraform-destroy:
+    name: Terraform Destroy
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action == 'destroy'
+    environment:
+      name: ${{ github.event.inputs.environment }}-destroy
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: ./.github/actions/aws-oidc
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+
+      - name: Setup Terraform
+        uses: ./.github/actions/setup-terraform
+        with:
+          terraform-version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Destroy
+        uses: ./.github/actions/terraform-destroy
+        with:
+          working-directory: terraform/environments/${{ github.event.inputs.environment }}/${{ env.SERVICE_NAME }}
+          backend-config: |
+            bucket=ramiz-takildar-infra
+            key=${{ github.event.inputs.environment }}/${{ env.SERVICE_NAME }}/terraform.tfstate
+            region=${{ env.AWS_REGION }}
+            dynamodb_table=terraform-locks
+            encrypt=true
+
+      - name: Post destroy summary
+        run: |
+          echo "## RDS Database Destroyed 🗑️" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Identifier:** ${{ github.event.inputs.identifier }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment:** ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Engine:** ${{ github.event.inputs.engine }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Destroyed by:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY

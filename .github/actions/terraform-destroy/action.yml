@@ -1,0 +1,240 @@
+# ============================================================================
+# Terraform Destroy Composite Action
+# ============================================================================
+# This composite action runs terraform destroy with proper backend configuration.
+#
+# Features:
+# - Dynamic backend configuration
+# - Auto-approve option
+# - Safety checks
+# - Confirmation prompts
+# - Backup state before destroy
+# ============================================================================
+
+name: 'Terraform Destroy'
+description: 'Run terraform destroy with dynamic backend configuration'
+
+inputs:
+  working-directory:
+    description: 'Working directory for Terraform'
+    required: true
+  
+  environment:
+    description: 'Environment name (dev, staging, prod)'
+    required: true
+  
+  service:
+    description: 'Service name'
+    required: true
+  
+  backend-bucket:
+    description: 'S3 bucket for Terraform state'
+    required: true
+    default: 'ramiz-takildar-infra'
+  
+  backend-region:
+    description: 'AWS region for backend'
+    required: false
+    default: 'us-east-1'
+  
+  backend-dynamodb-table:
+    description: 'DynamoDB table for state locking'
+    required: false
+    default: 'terraform-locks'
+  
+  auto-approve:
+    description: 'Auto-approve the destroy (use with caution)'
+    required: false
+    default: 'false'
+  
+  var-file:
+    description: 'Path to tfvars file'
+    required: false
+    default: ''
+  
+  additional-args:
+    description: 'Additional terraform destroy arguments'
+    required: false
+    default: ''
+  
+  skip-backup:
+    description: 'Skip state backup before destroy'
+    required: false
+    default: 'false'
+
+outputs:
+  destroy-exitcode:
+    description: 'Exit code from terraform destroy'
+    value: ${{ steps.destroy.outputs.exitcode }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Safety Check
+      shell: bash
+      run: |
+        echo "⚠️  WARNING: This will destroy infrastructure!"
+        echo "Environment: ${{ inputs.environment }}"
+        echo "Service: ${{ inputs.service }}"
+        echo "Working Directory: ${{ inputs.working-directory }}"
+        
+        # Extra safety for production
+        if [ "${{ inputs.environment }}" == "prod" ] || [ "${{ inputs.environment }}" == "production" ]; then
+          echo "🚨 PRODUCTION ENVIRONMENT DETECTED!"
+          if [ "${{ inputs.auto-approve }}" == "true" ]; then
+            echo "❌ Auto-approve is not recommended for production"
+            echo "Please review the resources to be destroyed carefully"
+          fi
+        fi
+    
+    - name: Terraform Init
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "🔧 Initializing Terraform with backend configuration..."
+        terraform init \
+          -backend-config="bucket=${{ inputs.backend-bucket }}" \
+          -backend-config="key=${{ inputs.environment }}/${{ inputs.service }}/terraform.tfstate" \
+          -backend-config="region=${{ inputs.backend-region }}" \
+          -backend-config="dynamodb_table=${{ inputs.backend-dynamodb-table }}" \
+          -backend-config="encrypt=true"
+        echo "✅ Terraform initialized successfully"
+    
+    - name: Backup State
+      if: inputs.skip-backup == 'false'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "💾 Backing up Terraform state..."
+        TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+        terraform state pull > "terraform.tfstate.backup-${TIMESTAMP}"
+        echo "✅ State backed up to: terraform.tfstate.backup-${TIMESTAMP}"
+    
+    - name: Terraform Plan Destroy
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "📋 Planning destroy operation..."
+        
+        # Build plan command
+        PLAN_CMD="terraform plan -destroy"
+        
+        # Add var-file if provided
+        if [ -n "${{ inputs.var-file }}" ]; then
+          PLAN_CMD="$PLAN_CMD -var-file=${{ inputs.var-file }}"
+        fi
+        
+        # Add additional args if provided
+        if [ -n "${{ inputs.additional-args }}" ]; then
+          PLAN_CMD="$PLAN_CMD ${{ inputs.additional-args }}"
+        fi
+        
+        # Run plan
+        $PLAN_CMD
+        echo "✅ Destroy plan completed"
+    
+    - name: Terraform Destroy
+      id: destroy
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "🗑️  Running terraform destroy..."
+        
+        # Build destroy command
+        DESTROY_CMD="terraform destroy"
+        
+        # Add auto-approve if enabled
+        if [ "${{ inputs.auto-approve }}" == "true" ]; then
+          DESTROY_CMD="$DESTROY_CMD -auto-approve"
+        fi
+        
+        # Add var-file if provided
+        if [ -n "${{ inputs.var-file }}" ]; then
+          DESTROY_CMD="$DESTROY_CMD -var-file=${{ inputs.var-file }}"
+        fi
+        
+        # Add additional args if provided
+        if [ -n "${{ inputs.additional-args }}" ]; then
+          DESTROY_CMD="$DESTROY_CMD ${{ inputs.additional-args }}"
+        fi
+        
+        # Run destroy
+        set +e
+        $DESTROY_CMD 2>&1 | tee destroy_output.txt
+        EXITCODE=$?
+        set -e
+        
+        echo "exitcode=$EXITCODE" >> $GITHUB_OUTPUT
+        
+        if [ $EXITCODE -eq 0 ]; then
+          echo "✅ Terraform destroy completed successfully"
+        else
+          echo "❌ Terraform destroy failed with exit code: $EXITCODE"
+          exit $EXITCODE
+        fi
+    
+    - name: Upload Destroy Logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: terraform-destroy-logs-${{ inputs.environment }}-${{ inputs.service }}
+        path: |
+          ${{ inputs.working-directory }}/destroy_output.txt
+          ${{ inputs.working-directory }}/terraform.tfstate.backup-*
+        retention-days: 90
+    
+    - name: Create Destroy Summary
+      if: steps.destroy.outputs.exitcode == '0'
+      shell: bash
+      run: |
+        echo "## Terraform Destroy Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Environment:** ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Service:** ${{ inputs.service }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Status:** ✅ Successfully Destroyed" >> $GITHUB_STEP_SUMMARY
+        echo "**Timestamp:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "⚠️ All resources have been destroyed" >> $GITHUB_STEP_SUMMARY
+
+# ============================================================================
+# Usage Example
+# ============================================================================
+#
+# jobs:
+#   destroy:
+#     runs-on: ubuntu-latest
+#     environment: development
+#     steps:
+#       - uses: actions/checkout@v4
+#       
+#       - name: Configure AWS Credentials
+#         uses: ./.github/actions/aws-oidc
+#         with:
+#           aws-region: us-east-1
+#           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+#       
+#       - name: Setup Terraform
+#         uses: ./.github/actions/setup-terraform
+#       
+#       - name: Terraform Destroy
+#         uses: ./.github/actions/terraform-destroy
+#         with:
+#           working-directory: terraform/environments/dev
+#           environment: dev
+#           service: ec2
+#           auto-approve: true
+#
+# ============================================================================
+# Safety Recommendations
+# ============================================================================
+#
+# 1. Never use auto-approve for production
+# 2. Always review the destroy plan
+# 3. Use GitHub Environments with required reviewers
+# 4. Enable branch protection rules
+# 5. Backup state before destroy
+# 6. Test destroy in dev/staging first
+# 7. Document recovery procedures
+# 8. Consider using prevent_destroy lifecycle
+#
+# ============================================================================

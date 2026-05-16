@@ -1,0 +1,148 @@
+# ============================================================================
+# AWS OIDC Authentication Composite Action
+# ============================================================================
+# This composite action configures AWS credentials using OIDC (OpenID Connect)
+# for secure, keyless authentication from GitHub Actions.
+#
+# Benefits of OIDC:
+# - No long-lived AWS credentials in GitHub Secrets
+# - Automatic credential rotation
+# - Fine-grained IAM permissions
+# - Audit trail via CloudTrail
+# - Reduced security risk
+#
+# Prerequisites:
+# - AWS IAM OIDC Identity Provider configured
+# - IAM Role with trust policy for GitHub Actions
+# - Appropriate permissions attached to the role
+# ============================================================================
+
+name: 'Configure AWS Credentials (OIDC)'
+description: 'Configure AWS credentials using OIDC for secure authentication'
+
+inputs:
+  aws-region:
+    description: 'AWS region to use'
+    required: true
+    default: 'us-east-1'
+  
+  role-to-assume:
+    description: 'ARN of the IAM role to assume'
+    required: true
+  
+  role-session-name:
+    description: 'Name for the role session'
+    required: false
+    default: 'GitHubActions'
+  
+  role-duration-seconds:
+    description: 'Duration of the role session in seconds'
+    required: false
+    default: '3600'
+
+outputs:
+  aws-account-id:
+    description: 'AWS Account ID'
+    value: ${{ steps.get-account.outputs.account-id }}
+  
+  aws-region:
+    description: 'AWS Region'
+    value: ${{ inputs.aws-region }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ inputs.role-to-assume }}
+        role-session-name: ${{ inputs.role-session-name }}
+        role-duration-seconds: ${{ inputs.role-duration-seconds }}
+        aws-region: ${{ inputs.aws-region }}
+        mask-aws-account-id: true
+    
+    - name: Get AWS Account ID
+      id: get-account
+      shell: bash
+      run: |
+        ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+        echo "account-id=$ACCOUNT_ID" >> $GITHUB_OUTPUT
+        echo "✅ Authenticated to AWS Account: $ACCOUNT_ID"
+    
+    - name: Verify AWS Credentials
+      shell: bash
+      run: |
+        echo "🔐 Verifying AWS credentials..."
+        aws sts get-caller-identity
+        echo "✅ AWS credentials verified successfully"
+
+# ============================================================================
+# Usage Example
+# ============================================================================
+#
+# jobs:
+#   deploy:
+#     runs-on: ubuntu-latest
+#     permissions:
+#       id-token: write
+#       contents: read
+#     steps:
+#       - uses: actions/checkout@v4
+#       
+#       - name: Configure AWS Credentials
+#         uses: ./.github/actions/aws-oidc
+#         with:
+#           aws-region: us-east-1
+#           role-to-assume: arn:aws:iam::123456789012:role/GitHubActionsRole
+#       
+#       - name: Deploy Infrastructure
+#         run: |
+#           terraform init
+#           terraform apply -auto-approve
+#
+# ============================================================================
+# IAM Role Trust Policy Example
+# ============================================================================
+#
+# {
+#   "Version": "2012-10-17",
+#   "Statement": [
+#     {
+#       "Effect": "Allow",
+#       "Principal": {
+#         "Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+#       },
+#       "Action": "sts:AssumeRoleWithWebIdentity",
+#       "Condition": {
+#         "StringEquals": {
+#           "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+#         },
+#         "StringLike": {
+#           "token.actions.githubusercontent.com:sub": "repo:your-org/your-repo:*"
+#         }
+#       }
+#     }
+#   ]
+# }
+#
+# ============================================================================
+# Setup Instructions
+# ============================================================================
+#
+# 1. Create OIDC Identity Provider in AWS:
+#    - Provider URL: https://token.actions.githubusercontent.com
+#    - Audience: sts.amazonaws.com
+#
+# 2. Create IAM Role:
+#    - Add trust policy (see example above)
+#    - Attach necessary permissions policies
+#
+# 3. Add Role ARN to GitHub Secrets:
+#    - Secret name: AWS_ROLE_ARN
+#    - Value: arn:aws:iam::123456789012:role/GitHubActionsRole
+#
+# 4. Use in workflow:
+#    - Add permissions: id-token: write
+#    - Use this composite action
+#
+# ============================================================================

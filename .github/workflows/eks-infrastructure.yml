@@ -1,0 +1,346 @@
+name: EKS Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      cluster_name:
+        description: 'EKS Cluster Name'
+        required: true
+        type: string
+      cluster_version:
+        description: 'Kubernetes Version'
+        required: false
+        type: string
+        default: '1.28'
+      instance_types:
+        description: 'Node Instance Types (comma-separated)'
+        required: false
+        type: string
+        default: 't3.medium'
+      desired_size:
+        description: 'Desired number of nodes'
+        required: false
+        type: string
+        default: '2'
+      min_size:
+        description: 'Minimum number of nodes'
+        required: false
+        type: string
+        default: '1'
+      max_size:
+        description: 'Maximum number of nodes'
+        required: false
+        type: string
+        default: '4'
+      enable_fargate:
+        description: 'Enable Fargate profiles'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  AWS_REGION: us-east-1
+  TF_VERSION: 1.6.0
+  SERVICE_NAME: eks
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action != 'destroy'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run tfsec
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: terraform/modules/eks
+          soft_fail: true
+
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: terraform/modules/eks
+          framework: terraform
+          soft_fail: true
+
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    needs: [security-scan]
+    if: |
+      always() &&
+      (needs.security-scan.result == 'success' || needs.security-scan.result == 'skipped')
+    environment:
+      name: ${{ github.event.inputs.environment }}
+    outputs:
+      plan_exitcode: ${{ steps.plan.outputs.exitcode }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: ./.github/actions/aws-oidc
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+
+      - name: Setup Terraform
+        uses: ./.github/actions/setup-terraform
+        with:
+          terraform-version: ${{ env.TF_VERSION }}
+
+      - name: Create Terraform variables file
+        run: |
+          cat > terraform.tfvars <<EOF
+          cluster_name    = "${{ github.event.inputs.cluster_name }}"
+          cluster_version = "${{ github.event.inputs.cluster_version }}"
+          environment     = "${{ github.event.inputs.environment }}"
+          
+          # VPC Configuration (update with your VPC details)
+          vpc_id     = "${{ secrets.VPC_ID }}"
+          subnet_ids = ${{ secrets.PRIVATE_SUBNET_IDS }}
+          
+          # Node Group Configuration
+          node_groups = {
+            general = {
+              desired_size   = ${{ github.event.inputs.desired_size }}
+              max_size       = ${{ github.event.inputs.max_size }}
+              min_size       = ${{ github.event.inputs.min_size }}
+              instance_types = [$(echo "${{ github.event.inputs.instance_types }}" | sed 's/,/","/g' | sed 's/^/"/' | sed 's/$/"/')]
+              capacity_type  = "ON_DEMAND"
+              disk_size      = 50
+              labels = {
+                role = "general"
+              }
+            }
+          }
+          
+          # Fargate Configuration
+          fargate_profiles = ${{ github.event.inputs.enable_fargate == 'true' && '{ default = { selectors = [{ namespace = "default" }] } }' || '{}' }}
+          fargate_subnet_ids = ${{ github.event.inputs.enable_fargate == 'true' && secrets.PRIVATE_SUBNET_IDS || '[]' }}
+          
+          # Security
+          cluster_endpoint_public_access_cidrs = ["0.0.0.0/0"]
+          
+          # Monitoring
+          cluster_enabled_log_types = ["api", "audit", "authenticator", "controllerManager", "scheduler"]
+          performance_insights_enabled = true
+          
+          # Tags
+          tags = {
+            Environment = "${{ github.event.inputs.environment }}"
+            ManagedBy   = "terraform"
+            Service     = "eks"
+            CreatedBy   = "${{ github.actor }}"
+          }
+          EOF
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}/${{ env.SERVICE_NAME }}
+
+      - name: Terraform Plan
+        id: plan
+        uses: ./.github/actions/terraform-plan
+        with:
+          working-directory: terraform/environments/${{ github.event.inputs.environment }}/${{ env.SERVICE_NAME }}
+          backend-config: |
+            bucket=ramiz-takildar-infra
+            key=${{ github.event.inputs.environment }}/${{ env.SERVICE_NAME }}/terraform.tfstate
+            region=${{ env.AWS_REGION }}
+            dynamodb_table=terraform-locks
+            encrypt=true
+
+      - name: Comment PR with Plan
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const output = `#### Terraform Plan 📖
+            **Environment:** \`${{ github.event.inputs.environment }}\`
+            **Service:** \`${{ env.SERVICE_NAME }}\`
+            **Cluster:** \`${{ github.event.inputs.cluster_name }}\`
+            
+            <details><summary>Show Plan</summary>
+            
+            \`\`\`terraform
+            ${{ steps.plan.outputs.stdout }}
+            \`\`\`
+            
+            </details>
+            
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+  terraform-apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    needs: [terraform-plan]
+    if: |
+      github.event.inputs.action == 'apply' &&
+      needs.terraform-plan.outputs.plan_exitcode == '2'
+    environment:
+      name: ${{ github.event.inputs.environment }}-apply
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: ./.github/actions/aws-oidc
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+
+      - name: Setup Terraform
+        uses: ./.github/actions/setup-terraform
+        with:
+          terraform-version: ${{ env.TF_VERSION }}
+
+      - name: Create Terraform variables file
+        run: |
+          cat > terraform.tfvars <<EOF
+          cluster_name    = "${{ github.event.inputs.cluster_name }}"
+          cluster_version = "${{ github.event.inputs.cluster_version }}"
+          environment     = "${{ github.event.inputs.environment }}"
+          
+          vpc_id     = "${{ secrets.VPC_ID }}"
+          subnet_ids = ${{ secrets.PRIVATE_SUBNET_IDS }}
+          
+          node_groups = {
+            general = {
+              desired_size   = ${{ github.event.inputs.desired_size }}
+              max_size       = ${{ github.event.inputs.max_size }}
+              min_size       = ${{ github.event.inputs.min_size }}
+              instance_types = [$(echo "${{ github.event.inputs.instance_types }}" | sed 's/,/","/g' | sed 's/^/"/' | sed 's/$/"/')]
+              capacity_type  = "ON_DEMAND"
+              disk_size      = 50
+              labels = {
+                role = "general"
+              }
+            }
+          }
+          
+          fargate_profiles = ${{ github.event.inputs.enable_fargate == 'true' && '{ default = { selectors = [{ namespace = "default" }] } }' || '{}' }}
+          fargate_subnet_ids = ${{ github.event.inputs.enable_fargate == 'true' && secrets.PRIVATE_SUBNET_IDS || '[]' }}
+          
+          cluster_endpoint_public_access_cidrs = ["0.0.0.0/0"]
+          cluster_enabled_log_types = ["api", "audit", "authenticator", "controllerManager", "scheduler"]
+          performance_insights_enabled = true
+          
+          tags = {
+            Environment = "${{ github.event.inputs.environment }}"
+            ManagedBy   = "terraform"
+            Service     = "eks"
+            CreatedBy   = "${{ github.actor }}"
+          }
+          EOF
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}/${{ env.SERVICE_NAME }}
+
+      - name: Terraform Apply
+        uses: ./.github/actions/terraform-apply
+        with:
+          working-directory: terraform/environments/${{ github.event.inputs.environment }}/${{ env.SERVICE_NAME }}
+          backend-config: |
+            bucket=ramiz-takildar-infra
+            key=${{ github.event.inputs.environment }}/${{ env.SERVICE_NAME }}/terraform.tfstate
+            region=${{ env.AWS_REGION }}
+            dynamodb_table=terraform-locks
+            encrypt=true
+
+      - name: Get EKS cluster info
+        id: eks-info
+        run: |
+          CLUSTER_ENDPOINT=$(terraform output -raw cluster_endpoint 2>/dev/null || echo "N/A")
+          CLUSTER_VERSION=$(terraform output -raw cluster_version 2>/dev/null || echo "N/A")
+          echo "endpoint=$CLUSTER_ENDPOINT" >> $GITHUB_OUTPUT
+          echo "version=$CLUSTER_VERSION" >> $GITHUB_OUTPUT
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}/${{ env.SERVICE_NAME }}
+
+      - name: Post deployment summary
+        run: |
+          echo "## EKS Cluster Deployed Successfully! 🚀" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Cluster Details" >> $GITHUB_STEP_SUMMARY
+          echo "- **Cluster Name:** ${{ github.event.inputs.cluster_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment:** ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Kubernetes Version:** ${{ steps.eks-info.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Endpoint:** ${{ steps.eks-info.outputs.endpoint }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Node Instance Types:** ${{ github.event.inputs.instance_types }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Desired Nodes:** ${{ github.event.inputs.desired_size }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Fargate Enabled:** ${{ github.event.inputs.enable_fargate }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Configure kubectl:" >> $GITHUB_STEP_SUMMARY
+          echo '   ```bash' >> $GITHUB_STEP_SUMMARY
+          echo "   aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ github.event.inputs.cluster_name }}" >> $GITHUB_STEP_SUMMARY
+          echo '   ```' >> $GITHUB_STEP_SUMMARY
+          echo "2. Verify cluster access:" >> $GITHUB_STEP_SUMMARY
+          echo '   ```bash' >> $GITHUB_STEP_SUMMARY
+          echo "   kubectl get nodes" >> $GITHUB_STEP_SUMMARY
+          echo '   ```' >> $GITHUB_STEP_SUMMARY
+
+  terraform-destroy:
+    name: Terraform Destroy
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action == 'destroy'
+    environment:
+      name: ${{ github.event.inputs.environment }}-destroy
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: ./.github/actions/aws-oidc
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+
+      - name: Setup Terraform
+        uses: ./.github/actions/setup-terraform
+        with:
+          terraform-version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Destroy
+        uses: ./.github/actions/terraform-destroy
+        with:
+          working-directory: terraform/environments/${{ github.event.inputs.environment }}/${{ env.SERVICE_NAME }}
+          backend-config: |
+            bucket=ramiz-takildar-infra
+            key=${{ github.event.inputs.environment }}/${{ env.SERVICE_NAME }}/terraform.tfstate
+            region=${{ env.AWS_REGION }}
+            dynamodb_table=terraform-locks
+            encrypt=true
+
+      - name: Post destroy summary
+        run: |
+          echo "## EKS Cluster Destroyed 🗑️" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Cluster Name:** ${{ github.event.inputs.cluster_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment:** ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Destroyed by:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
